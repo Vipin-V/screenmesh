@@ -1,0 +1,121 @@
+plugins {
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("org.jetbrains.kotlin.plugin.serialization")
+}
+
+android {
+    namespace = "com.screenmesh"
+    compileSdk = 34
+
+    defaultConfig {
+        applicationId = "com.screenmesh"
+        // 26 (Android 8, Oreo): the modern BLE/permission model this project's
+        // eventual BLE/Wi-Fi Direct/NFC work targets starts making sense here.
+        minSdk = 26
+        targetSdk = 34
+        versionCode = 1
+        versionName = "0.1.0"
+    }
+
+    buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
+    }
+
+    kotlinOptions {
+        jvmTarget = "17"
+    }
+
+    buildFeatures {
+        compose = true
+    }
+
+    // Pinned to the Kotlin 1.9.24 compiler this module already uses — see
+    // https://developer.android.com/jetpack/androidx/releases/compose-kotlin
+    composeOptions {
+        kotlinCompilerExtensionVersion = "1.5.14"
+    }
+}
+
+dependencies {
+    implementation("androidx.core:core-ktx:1.13.1")
+    implementation("androidx.appcompat:appcompat:1.7.0")
+    implementation("com.google.android.material:material:1.12.0")
+
+    // registerForActivityResult / ActivityResultContracts (BLE runtime
+    // permission requests in MainActivity). appcompat 1.7.0 already pulls
+    // in a compatible androidx.activity transitively; pinned explicitly
+    // here so the version isn't left to transitive resolution.
+    implementation("androidx.activity:activity-ktx:1.9.0")
+
+    // Jetpack Compose UI — the app's screens (Workspace, Pair, Devices) are
+    // built with it instead of the XML layout this module started with.
+    // BOM pins every androidx.compose.* artifact to a mutually-compatible
+    // set so individual versions don't need to be tracked by hand.
+    implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+    implementation("androidx.compose.ui:ui")
+    implementation("androidx.compose.ui:ui-graphics")
+    implementation("androidx.compose.material3:material3")
+    implementation("androidx.compose.material:material-icons-extended")
+    implementation("androidx.activity:activity-compose:1.9.0")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.3")
+    debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // QR code generation (Pair screen) and scanning (Onboarding "Scan QR
+    // code" — reads a pairing code straight off another device's screen,
+    // same as the web PWA scanning a phone's camera). zxing-android-embedded
+    // wraps CameraX + zxing:core into a ready-made scan Activity/
+    // ActivityResultContract, including its own camera-permission prompt —
+    // far less code than a hand-rolled CameraX + ML Kit analyzer for a
+    // single "scan one QR code" use case.
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
+
+    // Relay client (WebSocket + HTTP pairing calls) — same role as
+    // WebSocketRelayTransport (packages/transport) and the fetch() calls
+    // in apps/web/src/lib/app.ts / apps/agent/src/join.ts.
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    // JSON wire format — must match the shapes in packages/protocol
+    // exactly (EnvelopeJson, PresenceEntry, JoinWorkspaceResponse, ...).
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.6.3")
+
+    // Ed25519 / X25519 / HKDF: not reliably available across API 26+ via
+    // the platform's own javax.crypto/java.security providers (Android's
+    // native Ed25519/X25519 support is recent and inconsistent below
+    // API 33), so — like packages/crypto isolating Web Crypto behind an
+    // interface — this isolates BouncyCastle behind Identity.kt/Ratchet.kt.
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
+
+    // Local (plain-JVM) unit tests under src/test — the crypto/protocol
+    // files here have no Android API dependency, so `testDebugUnitTest`
+    // runs them straight on the JVM, no emulator/device needed. Mirrors
+    // packages/crypto and packages/protocol's vitest suites test-for-test
+    // — see docs/Android.md.
+    testImplementation("junit:junit:4.13.2")
+}
+
+// Prints the plain-JVM dependency classpath (one path per line), used to
+// run InteropSmoke.kt (the cross-language interop check against a real
+// TypeScript relay/engine — see docs/Android.md) directly with `java`
+// instead of on a device/emulator. Only the non-Android-API files in this
+// module (protocol/crypto/transport/sync, not MainActivity or
+// transport/nearby/*) are exercised that way.
+// CLASSPATH_ENTRY: prefix makes each line trivially greppable out of the
+// rest of Gradle's console noise — apps/android/scripts/run-interop-test.mjs
+// parses exactly this format.
+tasks.register("printRuntimeClasspath") {
+    doLast {
+        configurations.getByName("debugRuntimeClasspath").files.forEach {
+            println("CLASSPATH_ENTRY:${it.absolutePath}")
+        }
+    }
+}

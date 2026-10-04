@@ -1,0 +1,130 @@
+# ScreenMesh Roadmap
+
+The core interaction to validate:
+
+> Can a user move temporary information across devices faster and more naturally than sending it to themselves?
+
+## Phase 0 — Scaffold ✅
+
+- Monorepo, shared types, adapter interfaces, docs.
+
+## Phase 1 — MVP: QR-bootstrapped handoff ✅
+
+**Pairing & identity**
+- [x] Accountless device identity (Ed25519 signing + X25519 key agreement, generated locally)
+- [x] Workspace creation + QR / join-link pairing (single-use, expiring tokens; owner-minted)
+- [x] Workspace expiry (optional TTL at creation; relay refuses expired workspaces; clients clean up)
+- [x] Device revocation (owner-only; relay access cut immediately, roster pruned everywhere; per-pair ratcheting since Phase 5 means no group rekey is even needed — see Security.md §5)
+
+**Objects**
+- [x] Text, links, code snippets
+- [x] Images and small files (≤ 25 MB; secure file drop chunks anything above ~150 KB into multiple small envelopes — see Phase 5)
+- [x] Checklists (toggle/add items on any device; last-write-wins merge)
+- [x] Chunked transfer for larger files (Phase 5 — over whatever transport is active, not WebRTC-specific)
+
+**Sync**
+- [x] IndexedDB local storage (Dexie)
+- [x] Real-time relay sync (authenticated WebSocket, Ed25519 challenge)
+- [x] Offline queues on both sides: client outbox drains on reconnect; relay store-and-forward for offline recipients
+- [x] WebRTC direct transfer (data channels, relay-forwarded signaling, automatic relay fallback)
+- [x] CRDT editing (Yjs): concurrent text edits merge instead of overwriting
+
+**Device interactions**
+- [x] Device dashboard with live presence; shared objects board
+- [x] Send to one, several, or all devices (offline recipients get it on return)
+- [x] Delivery status lifecycle: queued → sending → delivered → opened
+- [x] Leave workspace (local cleanup; also triggered by revocation/expiry)
+- [x] Continue-on-device (hands the object off and auto-opens the editor on the target)
+
+**Security**
+- [x] End-to-end encrypted envelopes (AES-GCM + Ed25519 signatures)
+- [x] Replay protection: message-ID dedupe, sequence numbers, envelope expiry
+- [x] Workspace-key epoch rotation on revocation — **superseded in Phase 5** by per-pair Double Ratchet sessions (see Security.md §5); the epoch/`ROTATE_KEY` mechanism has been removed, not kept alongside it
+
+## Phase 2 — Eventual delivery ✅
+
+- [x] Expiring objects: optional TTL per send, enforced by a periodic sweep on every device — deletes the object locally and marks any still-in-flight delivery `expired` (history stays visible; only `opened` deliveries are left alone)
+- [x] Delivery options: `deleteAfterOpening` (recipient's copy vanishes right after `markOpened`); `requireConfirmation` (delivery sits as `pending` — content is visible but actions are gated — until the recipient explicitly Accepts or Rejects; rejecting notifies the sender and never executes/opens anything)
+- [x] Store–carry–forward: encrypted `DeliveryBundle`s (already defined in the protocol, previously unused) now actually get carried. A real object send is carry-eligible (`DEFAULT_HOP_LIMIT`); acks/control ops are not (`hopLimit: 0`), so only genuine object deliveries fan out to carriers. A `CARRY_BUNDLE` operation hands the bundle — still sealed for the true destination — to an online peer, which holds it in a `carried` table and forwards it the moment presence shows the destination online, via a dedicated relay `forward` path (see Security.md — the relay's normal sender-identity check doesn't apply to carriers, since the destination's own signature check is what authenticates the bundle, not the relay)
+- [x] Relay-side store-and-forward for offline recipients (shipped in Phase 1; still the primary path — carry is supplemental redundancy for when the *original sender* goes away before the destination reconnects)
+
+Known limitation at the time, resolved in Phase 5: this shipped when all workspace devices still shared one symmetric key, so a carrier *could* technically have decrypted what it was holding. Per-pair Double Ratchet sessions (Security.md §5) close this — a carrier now has no session with the true destination and genuinely cannot decrypt.
+
+## Phase 3 — Native nearby
+
+- [x] **Android app** (`apps/android`): a hand-ported Kotlin core of `packages/protocol`/`crypto`/`transport` (BouncyCastle for Ed25519/X25519/HKDF, OkHttp for the relay WebSocket + pairing HTTP) plus a `MeshEngine` — including store-carry-forward, `continueOnDevice`, last-write-wins object updates, secure file drop chunking, lightweight local persistence for objects/deliveries/outbox/carried bundles, identity/session persistence, and a reference UI, so the phone joins the same workspaces and speaks the same envelope/ratchet protocol as the web PWA and desktop agent — see docs/Android.md for exactly what's ported vs. deferred (Yjs collaborative editing isn't ported — no viable in-scope JVM port exists; ratchet-session internals and partial file-chunk reassembly are still in-memory only). **Fully verified, including on a real device**: builds and lints clean via a committed Gradle wrapper; a JVM-only cross-language interop run against the live TypeScript engine passed in both directions; and — going further — a real hardware-accelerated Android emulator (WHPX) was set up and the actual APK was installed and driven end to end through `adb` UI automation: real HTTP join, real Double-Ratchet-encrypted receive (verified + decrypted + displayed correctly), real send, and real identity/session persistence across a reinstall, all through the genuine Android runtime, not a JVM proxy for it. That pass caught and fixed a real UI layout bug (a button squeezed unreadable on a real screen width) that no code review had caught. See docs/Android.md's "Verification status" for the full report.
+- [x] Bluetooth LE / Wi-Fi Direct / NFC pairing and transport — real implementations exist in `apps/android`'s `transport/nearby/` (GATT peripheral+central for BLE, `WifiP2pManager` + TCP socket for Wi-Fi Direct, NDEF read/write for NFC), all compile cleanly, and all three are wired into `MainActivity`: BLE and NFC as nearby pairing bootstraps ("Scan nearby" / "Advertise via BLE" / "Write to NFC tag" — all reuse the same pairing-code string a QR carries, no new trust protocol), Wi-Fi Direct as a raw transport with its `BroadcastReceiver` lifecycle wired ("Scan nearby (Wi-Fi Direct)"). Review passes caught and fixed four real bugs here: a BLE double-connect race, an NFC cold-start intent that was silently dropped, an NFC "write mode" with no expiry (risking an accidental tag overwrite), and the UI layout bug mentioned above — see docs/Android.md. The nearby-radio code itself (BLE/Wi-Fi Direct/NFC specifically) is still untested on real hardware — an emulator has no Bluetooth/NFC radio and no second device to pair with — everything else in `apps/android` has now been run for real
+- Wi-Fi Aware as an optional high-throughput adapter
+- NFC tap-to-pair via passive tags on shared displays
+- [x] **Acoustic transport** (`transport/nearby/AcousticTransport.kt`): a near-ultrasonic (~18.5-21 kHz) mic/speaker data link — no Bluetooth/Wi-Fi/NFC radio at all. Rather than reimplementing OFDM/D-CSS modulation from scratch, this vendors the pure-Kotlin acoustic modem from [dweekly/cyrinx](https://github.com/dweekly/cyrinx)'s Android hardware-in-loop test app (`com.dweekly.cyrinxhil` — Apache-2.0, see that package's `NOTICE.md`); cyrinx's own canonical Swift/C implementation is macOS/iOS-only and was not usable here. Compiles and lints clean as part of the normal Gradle build (no native/JNI step). Single half-duplex point-to-point link (no multi-peer discovery, unlike BLE/Wi-Fi Direct) — one side starts as initiator, the other as responder. Real, measured throughput per upstream is under 0.3 kbps, with a 4096-byte hard cap per message — usable for a short pairing code or text note within earshot of a working mic/speaker, not for files. Untested over real air on real hardware (same caveat as BLE/Wi-Fi Direct/NFC — see docs/Android.md)
+
+## Phase 4 — Flagship experiments
+
+- UWB / Channel Sounding "point-to-send" targeting
+- Screen-to-camera optical pairing (animated QR → invisible modulation)
+- Apple Multipeer / Network.framework adapter
+
+## Phase 5 — Toward the device bus ✅
+
+- [x] **Forward-secret per-pair Double Ratchet sessions** (Security.md §5): replaces the shared workspace-key/epoch model entirely. Each device pair bootstraps a session from the QR-transported pairing secret + X25519 identity keys, then ratchets forward with fresh ephemeral keys on every round trip — a past-state compromise doesn't expose future messages, and revocation no longer needs a group-wide rekey since sessions are pairwise. Bounded out-of-order tolerance via a capped skipped-key cache
+- [x] **Temporary clipboard tunnel**: one-click "share clipboard for N minutes," built entirely on Phase 2's expiring-objects + delete-after-opening machinery — no new delivery mechanism needed
+- [x] **Secure file drop**: files above ~150 KB travel as a sequence of small `FILE_CHUNK` envelopes (each independently carry-eligible) instead of one giant envelope; the recipient reassembles and materializes the object only once every chunk has arrived
+- [x] **Capability routing**: devices advertise capabilities (camera, terminal, filesystem, local models, ...) via presence; a send can target "whichever device has X" (`MeshEngine.resolveCapability`, ranked online-first) instead of naming a specific device. Self-reported and unverified — a routing convenience among already-paired, already-trusted devices, not a privilege boundary (Security.md §6)
+- [x] **Trusted desktop agent** (`apps/agent`): a standalone Node CLI reusing the exact same crypto/sync/transport packages as the PWA — same ratchet sessions, same relay, same store-carry-forward. Persists device identity to a local JSON file (extractable keys + PKCS8 export, since there's no IndexedDB to lean on — Security.md §1) and resumes without re-pairing. Executes `command` objects only behind an interactive terminal approval prompt; never automatic
+- [x] **Agent-to-agent structured task channel**: a distinct `agent_task` object type (`{action, params}`) carries structured requests to a small handler registry (`echo`, `read_file`, `run_command`) rather than an open plugin system, still behind the same approval gate, replying with an ordinary `text` object
+
+`packages/sync/src/engine.ts` gained one general-purpose primitive along the way: `onObjectReceived`, a callback fired once every op in an incoming envelope has been applied (not mid-envelope) — needed because the Node agent has no Dexie liveQuery to react to new objects the way the web UI does.
+
+## Phase 6 â€” Real-world validation and hardening
+
+The capabilities below are implemented or have meaningful automated/emulator coverage. They are not production claims until they have been exercised under real radios, real browsers, and unfriendly networks.
+
+| Area | Existing implementation / coverage | Required real-world validation |
+| --- | --- | --- |
+| **Web PWA workflow** | Core UI, encrypted delivery, offline queues, typechecking, smoke coverage | Two actual devices: pairing, send/receive, mobile layout, Library, queue language, and recovery after interruption. |
+| **BLE pairing / short transport** | Android GATT central + peripheral, pairing-code flow, wired UI | Two physical Android phones: discovery, permissions, duplicate connection handling, reconnects, and short-message delivery. |
+| **Wi-Fi Direct transport** | Android `WifiP2pManager` discovery plus TCP transport, wired UI | Two physical Android phones: group-owner/client behavior, reconnects, throughput, and file delivery. |
+| **NFC tag pairing** | Android NDEF read/write helper and cold/warm intent paths | NFC-equipped phone plus real tag: write expiry, repeated tap behavior, app launch, and clear failure handling. |
+| **Acoustic transport** | Vendored Kotlin modem, loopback/noisy-channel test, wired Android transport | Two real phones in a real room: microphone/speaker response, echo, noise, distance, and practical pairing reliability. |
+| **Android product behavior** | APK build/lint, JVM tests, TypeScript/Kotlin interop, emulator join/send/receive/reconnect | Real device lifecycle, share sheet, rotation, battery/background constraints, and long-running delivery reliability. |
+| **Local Companion (desktop ↔ Android)** | Selected-interface listener, ephemeral pinned TLS, SM2 QR bootstrap, opaque-envelope direct route, and WebRTC/relay fallback; automated listener and socket-loss smoke coverage | Physical Android phone and desktop over Wi-Fi/Ethernet: bidirectional delivery, firewall denial, guest-Wi-Fi isolation, VPN/virtual adapter choice, Wi-Fi loss, extension/native-host restart, and measured fallback timing. See `LocalCompanionValidation.md`. |
+| **Cross-browser / iOS PWA** | Primary implementation is browser-based; Chromium path is the main tested environment | Safari and Firefox: IndexedDB, camera/pairing, clipboard permissions, PWA install, mobile layout, and iPhone/iPad behavior. |
+| **Restrictive networks** | WebRTC direct path and encrypted relay fallback | Corporate firewall/NAT environments, direct-to-relay fallback timing, and decision on TURN deployment. |
+
+For every validation run, record both the technical result and the user-facing outcome: pairing time, delivery time, recovery without manual re-send, actual route/fallback, battery or permission impact, and whether the status was understood as delivered, queued safely, waiting, or needs approval.
+
+Recommended order:
+
+1. Daily PWA use on two real devices.
+2. Android QR + relay flow on two physical phones.
+3. BLE, Wi-Fi Direct, NFC, and acoustic paths one at a time.
+4. Safari/iOS and Firefox checks.
+5. Restrictive network and relay-fallback testing.
+6. Local Companion physical Wi-Fi validation, followed by signed companion and
+   extension packaging/publication.
+
+## Phase 7 â€” Future transport and protocol research
+
+These are not commitments. They become roadmap work only when the existing paths are proven and a concrete user interaction justifies them.
+
+- Wi-Fi Aware for optional high-throughput Android device-to-device exchange.
+- Apple Multipeer / Network.framework for a polished native Apple path using the same ScreenMesh protocol.
+- UWB or Bluetooth Channel Sounding for **targeting** a nearby screen; payloads still use the best negotiated data route.
+- Screen-to-camera optical pairing for explicit, visible bootstrap on displays or shared machines.
+- Published one-time prekey bundles to improve the first-round-trip forward-secrecy story.
+- MLS-style group sessions if small-workspace pairwise sessions become a practical scaling constraint.
+- Capability verification/attestation; current capability advertisements remain self-reported routing hints, not a permission boundary.
+
+## Explicitly not in the first version
+
+- Full Notion-style editor
+- Complex team administration
+- AI summarization
+- Automatic command execution
+- Bluetooth-only communication
+- UWB positioning
+- Invisible optical transfer
+- Large-scale mesh routing
+- Native applications for every platform
+- Permanent file storage
+- Social collaboration / public note publishing

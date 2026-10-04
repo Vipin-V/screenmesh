@@ -1,0 +1,126 @@
+import Dexie, { type Table } from "dexie";
+import type {
+  Delivery,
+  DeliveryBundle,
+  Device,
+  FileChunkMeta,
+  MeshEvent,
+  MeshObject,
+  Operation,
+  Workspace,
+} from "@screenmesh/protocol";
+
+/** Key/value settings: identity, workspace config, sequence counters. */
+export interface SettingEntry {
+  key: string;
+  value: unknown;
+}
+
+/** Replay protection: message IDs we have already processed. */
+export interface SeenMessage {
+  messageId: string;
+  seenAt: number;
+}
+
+/** Persisted Yjs document state for collaboratively edited objects. */
+export interface YDocState {
+  objectId: string;
+  state: Uint8Array;
+}
+
+/** Personal organization metadata. It is intentionally local: pinning or
+ * tagging an object should not alter anybody else's workspace. */
+export interface ObjectLocalState {
+  objectId: string;
+  pinned?: boolean;
+  tags?: string[];
+  lastOpenedAt?: number;
+  continueLater?: boolean;
+}
+
+/**
+ * Persisted Double Ratchet session state, one row per peer device (this
+ * device's workspace is implicit — one ScreenMeshDb per workspace
+ * membership). Loosely typed here to avoid a storage → crypto dependency
+ * (see docs/Architecture.md §6 package map); callers in packages/sync
+ * cast this to the precise `RatchetSession` shape from
+ * @screenmesh/crypto, which they already depend on.
+ */
+export interface PersistedRatchetSession {
+  peerDeviceId: string;
+  [key: string]: unknown;
+}
+
+/**
+ * A single chunk of an in-progress incoming file drop, persisted as soon as
+ * it arrives — not just held in memory — so a page reload or a backgrounded
+ * tab losing its JS timers doesn't silently erase reassembly progress.
+ * `id` is `${fileId}:${chunkIndex}`; rows are deleted once the file
+ * finishes reassembling into a MeshObject.
+ */
+export interface PersistedFileChunk {
+  id: string;
+  fileId: string;
+  chunkIndex: number;
+  totalChunks: number;
+  dataB64: string;
+  meta?: FileChunkMeta;
+}
+
+/**
+ * Local-first persistence (IndexedDB via Dexie). Every device stores its
+ * own copy of the relevant workspace data; the server is never the primary
+ * database. See docs/Architecture.md §2 (Layer 3).
+ */
+export class ScreenMeshDb extends Dexie {
+  devices!: Table<Device, string>;
+  workspaces!: Table<Workspace, string>;
+  objects!: Table<MeshObject, string>;
+  operations!: Table<Operation, string>;
+  deliveries!: Table<Delivery, string>;
+  /** Local-only event ledger for activity and transport diagnostics. */
+  events!: Table<MeshEvent, string>;
+  /** Pending encrypted bundles awaiting a route (Eventual mode). */
+  outbox!: Table<DeliveryBundle, string>;
+  /** Encrypted bundles this device is carrying for other devices. */
+  carried!: Table<DeliveryBundle, string>;
+  settings!: Table<SettingEntry, string>;
+  seen!: Table<SeenMessage, string>;
+  ydocs!: Table<YDocState, string>;
+  objectStates!: Table<ObjectLocalState, string>;
+  ratchets!: Table<PersistedRatchetSession, string>;
+  /** Durable buffer for in-progress incoming file-chunk reassembly. */
+  fileChunks!: Table<PersistedFileChunk, string>;
+
+  constructor(name = "screenmesh") {
+    super(name);
+    this.version(1).stores({
+      devices: "id, status, trusted",
+      workspaces: "id, mode, expiresAt",
+      objects: "id, workspaceId, type, updatedAt, expiresAt",
+      operations: "operationId, workspaceId, deviceId, timestamp",
+      deliveries: "id, objectId, destinationDeviceId, status",
+      outbox: "bundleId, destinationDeviceId, expiresAt",
+      carried: "bundleId, destinationDeviceId, expiresAt",
+    });
+    this.version(2).stores({
+      settings: "key",
+      seen: "messageId, seenAt",
+    });
+    this.version(3).stores({
+      ydocs: "objectId",
+    });
+    this.version(4).stores({
+      ratchets: "peerDeviceId",
+    });
+    this.version(5).stores({
+      events: "id, timestamp, category, type, deviceId, objectId",
+    });
+    this.version(6).stores({
+      objectStates: "objectId, pinned, lastOpenedAt, continueLater",
+    });
+    this.version(7).stores({
+      fileChunks: "id, fileId",
+    });
+  }
+}

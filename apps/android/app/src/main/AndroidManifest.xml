@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Relay connectivity (WebSocket + pairing HTTP calls) — needed now. -->
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!--
+      Nearby transports (docs/Android.md) — real implementations in
+      transport/nearby/*.kt, but still UNTESTED (no device/hardware in the
+      environment they were written in). Runtime permission REQUESTS
+      (as opposed to these manifest declarations) are the caller's
+      responsibility — see each transport class's doc comment.
+    -->
+
+    <!-- BLE (API 31+ needs the new runtime-requestable BLUETOOTH_* permissions;
+         below API 31, BLUETOOTH/BLUETOOTH_ADMIN + ACCESS_FINE_LOCATION are used
+         instead — an app targeting minSdk 26 needs both blocks). Our BLE scan
+         filters by service UUID only, never used to derive location, hence
+         "neverForLocation" on BLUETOOTH_SCAN. -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <!-- Wi-Fi Direct (API 33+ additionally wants NEARBY_WIFI_DEVICES, also
+         never used to derive location). -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" android:usesPermissionFlags="neverForLocation" />
+    <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
+
+    <!-- Below API 33, both BLE (API 31-32 without the neverForLocation grant
+         path on some OEM skins) and Wi-Fi Direct peer discovery still want
+         this — see BleTransport.kt / WifiDirectTransport.kt. Android 12+
+         requires ACCESS_COARSE_LOCATION to be declared alongside FINE
+         (lint: CoarseFineLocation) even though this app only ever
+         requests FINE at runtime. -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" android:maxSdkVersion="32" />
+
+    <!-- NFC (tap-to-pair — read-only/write NDEF is enough for exchanging a
+         pairing code, no HCE needed). -->
+    <uses-permission android:name="android.permission.NFC" />
+    <uses-feature android:name="android.hardware.nfc" android:required="false" />
+
+    <!-- Acoustic transport (AcousticTransport.kt, vendored cyrinx DSP —
+         com/dweekly/cyrinxhil/NOTICE.md): needs the microphone to demodulate
+         incoming frames; the speaker side needs no permission. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+
+    <!-- QR scanning for pairing (zxing-android-embedded's CaptureActivity
+         requests this itself at runtime; declared here so that request can
+         succeed). Not required — pasting a code/link still works without a
+         camera. -->
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-feature android:name="android.hardware.camera.autofocus" android:required="false" />
+
+    <application
+        android:allowBackup="true"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.ScreenMesh"
+        android:usesCleartextTraffic="true">
+        <!--
+          usesCleartextTraffic: dev convenience only, matching the PWA's own
+          "self-signed HTTPS on the LAN" story — point RELAY_BASE_URL
+          (MeshEngine construction site) at a plain http:// dev relay while
+          testing locally. Remove for anything beyond local development.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:launchMode="singleTop"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Tapping a ScreenMesh pairing tag launches straight into
+                 MainActivity even when the app wasn't already running; see
+                 NfcPairing.kt (MIME_TYPE must match exactly). -->
+            <intent-filter>
+                <action android:name="android.nfc.action.NDEF_DISCOVERED" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="application/vnd.screenmesh.pairing" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

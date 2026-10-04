@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="ScreenMesh"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Relay server URL"
+            android:layout_marginTop="8dp" />
+        <EditText
+            android:id="@+id/et_server_url"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="http://10.0.2.2:8787/api"
+            android:inputType="textUri"
+            android:text="http://10.0.2.2:8787/api" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Pairing code (from the web app's QR / join link)"
+            android:layout_marginTop="8dp" />
+        <EditText
+            android:id="@+id/et_pairing_code"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="SM1.workspaceId.pairingToken.key.expiry"
+            android:inputType="text" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="This device's name"
+            android:layout_marginTop="8dp" />
+        <EditText
+            android:id="@+id/et_device_name"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="My Android Phone"
+            android:inputType="text" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="8dp">
+
+            <Button
+                android:id="@+id/btn_join"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Join workspace" />
+
+            <Button
+                android:id="@+id/btn_forget"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="Forget device" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/tv_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Not joined."
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Nearby pairing (BLE / NFC) — UNTESTED, see docs/Android.md"
+            android:layout_marginTop="16dp" />
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:layout_marginTop="8dp">
+
+            <Button
+                android:id="@+id/btn_scan_nearby"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Scan nearby" />
+
+            <Button
+                android:id="@+id/btn_advertise_ble"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:text="Advertise via BLE" />
+        </LinearLayout>
+
+        <!--
+          Deliberately its own row, not crammed into the row above: three
+          wrap_content buttons side by side ran out of horizontal width on
+          a real device/emulator, squeezing this one into a near-zero-width
+          sliver with vertically-wrapped letters (found via on-device
+          testing, not visible from just reading the XML).
+        -->
+        <Button
+            android:id="@+id/btn_nfc_write"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Write to NFC tag" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Wi-Fi Direct (raw transport, not pairing) — UNTESTED"
+            android:layout_marginTop="16dp" />
+        <Button
+            android:id="@+id/btn_wifi_direct_scan"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Scan nearby (Wi-Fi Direct)" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Acoustic (mic/speaker, no radio) — very slow, UNTESTED"
+            android:layout_marginTop="16dp" />
+        <!--
+          Own column, not a horizontal row: two wrap_content buttons with
+          labels this long repeated the earlier NFC-button squeeze (see the
+          comment on btn_nfc_write above) — "Start acoustic (responder)"
+          wrapped into three cramped lines when placed beside the other
+          button. Found via on-device screenshot, not visible from the XML.
+        -->
+        <Button
+            android:id="@+id/btn_acoustic_initiator"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Start acoustic (initiator)" />
+
+        <Button
+            android:id="@+id/btn_acoustic_responder"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Start acoustic (responder)" />
+
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="1dp"
+            android:background="#33000000"
+            android:layout_marginTop="16dp"
+            android:layout_marginBottom="16dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Send a text object to every other device in the workspace" />
+        <EditText
+            android:id="@+id/et_message"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Message text"
+            android:inputType="text" />
+        <Button
+            android:id="@+id/btn_send"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Send to all"
+            android:layout_marginTop="8dp" />
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Log"
+            android:textStyle="bold"
+            android:layout_marginTop="16dp" />
+        <TextView
+            android:id="@+id/tv_log"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text=""
+            android:fontFamily="monospace"
+            android:textIsSelectable="true" />
+
+    </LinearLayout>
+</ScrollView>

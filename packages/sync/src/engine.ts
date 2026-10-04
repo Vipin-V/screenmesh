@@ -1,0 +1,1518 @@
+import * as Y from "yjs";
+import {
+  DEFAULT_HOP_LIMIT,
+  envelopeFromJson,
+  envelopeToJson,
+  fromBase64,
+  toBase64,
+  type CarryBundlePayload,
+  type ChecklistContent,
+  type ContinueOnDevicePayload,
+  type CreateObjectPayload,
+  type Delivery,
+  type DeliveryBundle,
+  type Device,
+  type EditPresencePayload,
+  type EnvelopeJson,
+  type FileChunkAckPayload,
+  type FileChunkPayload,
+  type FileContent,
+  type MeshObject,
+  type MeshObjectType,
+  type MeshEvent,
+  type ObjectRefPayload,
+  type Operation,
+  type OperationType,
+  type PresenceEntry,
+  type RevokeDevicePayload,
+  type SendOptions,
+  type SendToDevicePayload,
+  type TextContent,
+  type UpdateObjectPayload,
+  type YjsUpdatePayload,
+} from "@screenmesh/protocol";
+import {
+  decryptEnvelope,
+  exportRawWorkspaceKey,
+  importEncryptionPublicKey,
+  importPublicKey,
+  initRatchetSession,
+  ratchetDecrypt,
+  ratchetEncrypt,
+  sealEnvelope,
+  verifyEnvelope,
+  type DeviceIdentity,
+  type RatchetSession,
+} from "@screenmesh/crypto";
+import type { PersistedRatchetSession, ScreenMeshDb } from "@screenmesh/storage";
+import type { WebSocketRelayTransport } from "@screenmesh/transport";
+
+const OUTBOX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const SEEN_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/** No FILE_CHUNK_ACK for a chunked transfer in this long → resend whatever
+ *  hasn't been acked yet (the recipient may have reconnected, or dropped
+ *  one message, without the sender ever finding out otherwise). */
+const FILE_TRANSFER_STALL_MS = 20_000;
+/** No full completion this long after a chunked transfer started → stop
+ *  retrying automatically and let the user retry it explicitly instead of
+ *  hanging as "Sending" forever. */
+const FILE_TRANSFER_FAIL_MS = 3 * 60_000;
+/** How often to sweep expired objects/bundles and advance store-carry-forward. */
+const DEFAULT_SWEEP_INTERVAL_MS = 15_000;
+/** No EDIT_PRESENCE heartbeat this long → treat that device as no longer
+ *  editing (it closed the editor without sending the `active: false`
+ *  ping, e.g. it crashed or lost connectivity). Comfortably longer than
+ *  the UI's own heartbeat interval to tolerate normal jitter. */
+const EDIT_PRESENCE_STALE_MS = 10_000;
+
+/** Object types whose text is collaboratively editable via Yjs. */
+const EDITABLE_TYPES = new Set(["text", "document", "code", "link"]);
+/** These four share the same {text, title?} content shape, so switching
+ *  between them (e.g. correcting a misdetected type) never touches content. */
+const TEXT_FAMILY_TYPES = new Set<MeshObjectType>(["text", "document", "code", "link"]);
+/** Object types a user can manually reclassify after a wrong auto-detection. */
+export const RETYPEABLE_TYPES: MeshObjectType[] = ["text", "document", "code", "link", "checklist"];
+
+function checklistItemFromLine(line: string): { id: string; text: string; done: boolean } {
+  const done = /^\s*[-*+]?\s*\[[xX]\]\s*/.test(line);
+  const text = line.replace(/^\s*[-*+]?\s*\[[ xX]?\]\s*/, "").replace(/^\s*[-*+]\s+/, "").replace(/^\s*\d+[.)]\s+/, "").trim();
+  return { id: crypto.randomUUID(), text, done };
+}
+
+/** Converts content between the shapes RETYPEABLE_TYPES use. Returns undefined
+ *  for an unsupported pairing (the caller should then leave the object alone). */
+function convertObjectContent(from: MeshObjectType, to: MeshObjectType, content: unknown): unknown | undefined {
+  if (from === to) return content;
+  if (TEXT_FAMILY_TYPES.has(from) && TEXT_FAMILY_TYPES.has(to)) return content;
+  if (TEXT_FAMILY_TYPES.has(from) && to === "checklist") {
+    const text = (content as TextContent | null)?.text ?? "";
+    const items = text.split("\n").map((line) => line.trim()).filter(Boolean).map(checklistItemFromLine);
+    return { items } satisfies ChecklistContent;
+  }
+  if (from === "checklist" && TEXT_FAMILY_TYPES.has(to)) {
+    const items = (content as ChecklistContent | null)?.items ?? [];
+    const text = items.map((item) => `${item.done ? "- [x]" : "- [ ]"} ${item.text}`).join("\n");
+    return { text } satisfies TextContent;
+  }
+  return undefined;
+}
+
+/**
+ * Secure file drop: files whose base64 payload exceeds this many
+ * characters (~150 KB raw) are split into chunks, each its own envelope
+ * (own ratchet message, own carry-eligibility), rather than one giant
+ * envelope. Keeps individual messages small regardless of file size.
+ */
+const FILE_CHUNK_SIZE_B64 = 200_000;
+const FILE_CHUNK_THRESHOLD_B64 = FILE_CHUNK_SIZE_B64;
+
+/** Apply `next` to a Y.Text as a minimal splice (common prefix/suffix). */
+function applyTextDiff(ytext: Y.Text, next: string): void {
+  const prev = ytext.toString();
+  if (prev === next) return;
+  let start = 0;
+  while (start < prev.length && start < next.length && prev[start] === next[start]) {
+    start++;
+  }
+  let endPrev = prev.length;
+  let endNext = next.length;
+  while (endPrev > start && endNext > start && prev[endPrev - 1] === next[endNext - 1]) {
+    endPrev--;
+    endNext--;
+  }
+  if (endPrev > start) ytext.delete(start, endPrev - start);
+  if (endNext > start) ytext.insert(start, next.slice(start, endNext));
+}
+
+/** An optional direct (peer-to-peer) byte channel, e.g. WebRTC. */
+export interface DirectChannel {
+  /** Returns true if the bytes were handed to an OPEN direct channel. */
+  trySend(peerId: string, data: Uint8Array): boolean | Promise<boolean>;
+  onMessage(handler: (data: Uint8Array) => void): void;
+}
+
+export interface EngineConfig {
+  db: ScreenMeshDb;
+  identity: DeviceIdentity;
+  workspaceId: string;
+  /** Pairing secret from the QR — seeds every pairwise ratchet session
+   *  (docs/Security.md §5), not used to encrypt anything directly. */
+  workspaceKey: CryptoKey;
+  /** Only this device may revoke devices. */
+  ownerDeviceId: string;
+  transport: WebSocketRelayTransport;
+  /** Optional peer-to-peer channel tried before the relay (WebRTC). */
+  direct?: DirectChannel;
+  now?: () => number;
+  /** Override the periodic sweep cadence (tests use a short interval). */
+  sweepIntervalMs?: number;
+  /** Override how long a chunked file transfer can go without a new
+   *  FILE_CHUNK_ACK before missing chunks are resent (tests use a short interval). */
+  fileTransferStallMs?: number;
+  /** Override how long a chunked file transfer can run without completing
+   *  before it's marked "failed" (tests use a short interval). */
+  fileTransferFailMs?: number;
+  /**
+   * Fires whenever a NEW object (not a duplicate/already-known one)
+   * arrives from another device — whole objects via CREATE_OBJECT, large
+   * files once chunk reassembly completes. The web UI doesn't need this
+   * (Dexie liveQuery already reacts to the objects table), but non-UI
+   * consumers with no reactive store — the Node desktop agent — do.
+   */
+  onObjectReceived?: (object: MeshObject, senderId: string) => void;
+  /**
+   * Fires whenever the set of OTHER devices actively editing an object
+   * changes (an EDIT_PRESENCE ping arrived, or a stale entry was swept).
+   * Ephemeral, not backed by Dexie, so unlike onObjectReceived the web UI
+   * needs this too — there's no liveQuery to react to instead.
+   */
+  onEditingPresenceChanged?: (objectId: string, activeDeviceIds: string[]) => void;
+}
+
+/**
+ * MeshEngine ties the layers together (docs/Architecture.md §4):
+ * UI action → oplog + local store → encrypt/envelope → transport,
+ * and the reverse on receive: verify → decrypt → apply → acknowledge.
+ * When the transport is down, envelopes wait in the IndexedDB outbox
+ * and drain on reconnect (the relay queues for offline recipients too).
+ */
+export class MeshEngine {
+  private seq = 0;
+  private readonly peerKeys = new Map<string, CryptoKey>();
+  /** In-memory Double Ratchet sessions, one per peer device. */
+  private readonly ratchets = new Map<string, RatchetSession>();
+  /** Raw bytes of the pairing secret, computed once in start(). */
+  private pairingSecret!: Uint8Array;
+  /** In-memory Yjs docs for collaboratively edited objects. */
+  private readonly ydocs = new Map<string, Y.Doc>();
+  /** Ephemeral "who's editing this object right now" — objectId -> deviceId
+   *  -> last heartbeat receive time. Never persisted; presence is only
+   *  meaningful while devices are live. */
+  private readonly editingPresence = new Map<string, Map<string, number>>();
+  /** In-progress file reassembly buffers, keyed by fileId. Rehydrated from
+   *  the durable `fileChunks` table in start() so a reload mid-transfer
+   *  doesn't lose progress — this Map is a read/write-through cache over it. */
+  private readonly incomingChunks = new Map<
+    string,
+    { total: number; chunks: Map<number, string>; meta?: FileChunkPayload["meta"] }
+  >();
+  private sweepTimer: ReturnType<typeof setInterval> | null = null;
+  /** Serializes handleIncoming calls — see start()'s `incoming` handler. */
+  private incomingQueue: Promise<void> = Promise.resolve();
+
+  constructor(private readonly cfg: EngineConfig) {}
+
+  private get me(): string {
+    return this.cfg.identity.deviceId;
+  }
+
+  private now(): number {
+    return this.cfg.now ? this.cfg.now() : Date.now();
+  }
+
+  /** Records operational metadata locally; never records object plaintext or encryption keys. */
+  private async recordEvent(event: Omit<MeshEvent, "id" | "timestamp">): Promise<void> {
+    await this.cfg.db.events.put({ id: crypto.randomUUID(), timestamp: this.now(), ...event });
+  }
+
+  /**
+   * Records local route lifecycle in the Activity ledger. This deliberately
+   * accepts operational metadata only; no caller can add object plaintext.
+   */
+  async recordRouteEvent(type: string, title: string, detail: string, deviceId?: string): Promise<void> {
+    await this.recordEvent({ category: "network", type, title, detail, ...(deviceId ? { deviceId } : {}) });
+  }
+
+  /** Records local trust-boundary changes without storing secrets or payloads. */
+  async recordSecurityEvent(type: string, title: string, detail: string, deviceId?: string): Promise<void> {
+    await this.recordEvent({ category: "security", type, title, detail, ...(deviceId ? { deviceId } : {}) });
+  }
+
+  async start(): Promise<void> {
+    const seqSetting = await this.cfg.db.settings.get("mySeq");
+    this.seq = typeof seqSetting?.value === "number" ? seqSetting.value : 0;
+
+    this.pairingSecret = await exportRawWorkspaceKey(this.cfg.workspaceKey);
+    for (const row of await this.cfg.db.ratchets.toArray()) {
+      const { peerDeviceId, ...session } = row;
+      this.ratchets.set(peerDeviceId, session as unknown as RatchetSession);
+    }
+
+    await this.rehydrateIncomingChunks();
+
+    await this.cfg.db.seen
+      .where("seenAt")
+      .below(this.now() - SEEN_RETENTION_MS)
+      .delete();
+
+    const transport = this.cfg.transport;
+    // Envelopes must be processed one at a time, in arrival order: handling
+    // one mutates and persists this.ratchets' shared Double Ratchet chain
+    // state (read → derive → save), so if two arrive close enough together
+    // to run concurrently (a burst — e.g. a device coming back online to a
+    // backlog of queued messages, or a resend of several missing file
+    // chunks at once), the second can decrypt against a chain state the
+    // first hasn't saved yet and fail ("Cipher job failed"). A relay/WebRTC
+    // message handler is otherwise fire-and-forget with no such ordering
+    // guarantee, so this queues each call behind the previous one's result.
+    const incoming = (data: Uint8Array) => {
+      this.incomingQueue = this.incomingQueue
+        .then(
+          () => this.handleIncoming(data),
+          () => this.handleIncoming(data),
+        )
+        .catch((err) => {
+          console.error("screenmesh: failed to process incoming envelope", err);
+        });
+    };
+    transport.onMessage(incoming);
+    this.cfg.direct?.onMessage(incoming);
+    transport.subscribePresence((devices) => {
+      void this.applyPresence(devices);
+    });
+    transport.subscribeStatus((status) => {
+      if (status === "connected") void this.drainOutbox();
+    });
+    await transport.open();
+
+    void this.periodicSweep();
+    this.sweepTimer = setInterval(
+      () => void this.periodicSweep(),
+      this.cfg.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS,
+    );
+  }
+
+  async stop(): Promise<void> {
+    if (this.sweepTimer) {
+      clearInterval(this.sweepTimer);
+      this.sweepTimer = null;
+    }
+    await this.cfg.transport.disconnect();
+  }
+
+  /** Create an object locally and send it to each recipient device. */
+  async sendObject(
+    input: { type: MeshObjectType; content: unknown },
+    recipientIds: string[],
+    options: SendOptions = {},
+  ): Promise<MeshObject> {
+    const now = this.now();
+    const object: MeshObject = {
+      id: crypto.randomUUID(),
+      workspaceId: this.cfg.workspaceId,
+      type: input.type,
+      content: input.content,
+      createdBy: this.me,
+      createdAt: now,
+      updatedAt: now,
+      ...(options.expiresAt !== undefined ? { expiresAt: options.expiresAt } : {}),
+    };
+    await this.cfg.db.objects.add(object);
+
+    // Editable objects get a Yjs doc seeded by the CREATOR only; everyone
+    // else receives the seeded state, so concurrent edits merge cleanly.
+    let seedUpdateB64: string | null = null;
+    if (EDITABLE_TYPES.has(object.type)) {
+      const doc = new Y.Doc();
+      const text = (object.content as TextContent | null)?.text ?? "";
+      doc.getText("text").insert(0, text);
+      this.ydocs.set(object.id, doc);
+      await this.persistDoc(object.id, doc);
+      seedUpdateB64 = toBase64(Y.encodeStateAsUpdate(doc));
+    }
+
+    // Secure file drop: large files travel as a sequence of small chunk
+    // envelopes instead of one giant one (see FILE_CHUNK_THRESHOLD_B64).
+    const asFile =
+      (object.type === "file" || object.type === "image") && (object.content as FileContent);
+    const chunked = asFile && asFile.dataB64.length > FILE_CHUNK_THRESHOLD_B64;
+    const totalChunksIfFile = chunked && asFile ? Math.ceil(asFile.dataB64.length / FILE_CHUNK_SIZE_B64) : undefined;
+
+    for (const recipientId of recipientIds) {
+      const delivery: Delivery = {
+        id: crypto.randomUUID(),
+        objectId: object.id,
+        sourceDeviceId: this.me,
+        destinationDeviceId: recipientId,
+        status: "queued",
+        createdAt: now,
+        ...(Object.keys(options).length > 0 ? { options } : {}),
+        ...(totalChunksIfFile !== undefined ? { chunkProgress: { totalChunks: totalChunksIfFile, ackedChunks: [] } } : {}),
+      };
+      await this.cfg.db.deliveries.add(delivery);
+      await this.recordEvent({
+        category: "transfer",
+        type: "delivery-created",
+        title: "Payload queued for delivery",
+        detail: `${object.type} → ${recipientId}`,
+        deviceId: recipientId,
+        objectId: object.id,
+      });
+
+      let sentLive: boolean;
+      if (chunked && asFile) {
+        sentLive = await this.sendFileChunks(object, asFile, recipientId, options);
+      } else {
+        const ops: Operation<unknown>[] = [
+          this.makeOp("CREATE_OBJECT", object.id, {
+            object,
+          } satisfies CreateObjectPayload),
+        ];
+        if (seedUpdateB64 !== null) {
+          ops.push(
+            this.makeOp("YJS_UPDATE", object.id, {
+              objectId: object.id,
+              updateB64: seedUpdateB64,
+            } satisfies YjsUpdatePayload),
+          );
+        }
+        ops.push(
+          this.makeOp("SEND_TO_DEVICE", object.id, {
+            objectId: object.id,
+            options,
+          } satisfies SendToDevicePayload),
+        );
+        // Real object deliveries are carry-eligible: if this recipient is
+        // unreachable directly, another online device may later carry the
+        // encrypted bundle on our behalf (docs/Architecture.md §2).
+        sentLive = await this.sendOps(recipientId, ops, DEFAULT_HOP_LIMIT);
+      }
+      if (sentLive) {
+        await this.cfg.db.deliveries.update(delivery.id, { status: "sending", lastActivityAt: this.now() });
+        await this.recordEvent({ category: "transfer", type: "delivery-sent", title: "Payload handed to transport", detail: `${object.type} → ${recipientId}`, deviceId: recipientId, objectId: object.id });
+      }
+    }
+    return object;
+  }
+
+  /** Send a large file as a sequence of small chunk envelopes; each chunk
+   *  is its own carry-eligible envelope. Returns true only if every chunk
+   *  went out live (matching sendOps' live/queued return contract). Pass
+   *  `onlyChunks` to resend just the chunks that were never acked instead
+   *  of the whole file again (see retryStalledFileTransfers). */
+  private async sendFileChunks(
+    object: MeshObject,
+    file: FileContent,
+    recipientId: string,
+    options: SendOptions,
+    onlyChunks?: ReadonlySet<number>,
+  ): Promise<boolean> {
+    const totalChunks = Math.ceil(file.dataB64.length / FILE_CHUNK_SIZE_B64);
+    let allLive = true;
+    for (let i = 0; i < totalChunks; i++) {
+      if (onlyChunks && !onlyChunks.has(i)) continue;
+      const dataB64 = file.dataB64.slice(i * FILE_CHUNK_SIZE_B64, (i + 1) * FILE_CHUNK_SIZE_B64);
+      const payload: FileChunkPayload = {
+        fileId: object.id,
+        chunkIndex: i,
+        totalChunks,
+        dataB64,
+        ...(i === 0
+          ? {
+              meta: {
+                objectType: object.type as "file" | "image",
+                name: file.name,
+                mimeType: file.mimeType,
+                size: file.size,
+                createdBy: object.createdBy,
+                createdAt: object.createdAt,
+                ...(object.expiresAt !== undefined ? { expiresAt: object.expiresAt } : {}),
+                ...(Object.keys(options).length > 0 ? { options } : {}),
+              },
+            }
+          : {}),
+      };
+      const sentLive = await this.sendOps(
+        recipientId,
+        [this.makeOp("FILE_CHUNK", object.id, payload)],
+        DEFAULT_HOP_LIMIT,
+      );
+      if (!sentLive) allLive = false;
+    }
+    return allLive;
+  }
+
+  /** Loads any not-yet-completed incoming file chunks from the durable
+   *  `fileChunks` table back into memory, so a reload or a backgrounded tab
+   *  losing its JS state doesn't discard reassembly progress. If every
+   *  chunk for a file happens to already be present, finishes it right away
+   *  — that would otherwise never happen without a chunk actually re-arriving. */
+  private async rehydrateIncomingChunks(): Promise<void> {
+    const rows = await this.cfg.db.fileChunks.toArray();
+    if (rows.length === 0) return;
+    const byFile = new Map<string, typeof rows>();
+    for (const row of rows) {
+      const bucket = byFile.get(row.fileId);
+      if (bucket) bucket.push(row);
+      else byFile.set(row.fileId, [row]);
+    }
+    for (const [fileId, chunks] of byFile) {
+      const total = chunks[0]!.totalChunks;
+      const entry: { total: number; chunks: Map<number, string>; meta?: FileChunkPayload["meta"] } = {
+        total,
+        chunks: new Map(chunks.map((row) => [row.chunkIndex, row.dataB64])),
+      };
+      const withMeta = chunks.find((row) => row.meta);
+      if (withMeta?.meta) entry.meta = withMeta.meta;
+      this.incomingChunks.set(fileId, entry);
+    }
+    const now = this.now();
+    for (const fileId of [...byFile.keys()]) {
+      await this.finishIncomingFileIfComplete(fileId, now);
+    }
+  }
+
+  /** Shared by the live FILE_CHUNK handler and startup rehydration: if every
+   *  chunk for `fileId` has arrived, materializes the MeshObject, cleans up
+   *  the durable chunk buffer, and records the delivery. Fires
+   *  onObjectReceived directly since this can run outside applyOp's
+   *  per-envelope batching (e.g. at startup). */
+  private async finishIncomingFileIfComplete(fileId: string, now: number): Promise<void> {
+    const entry = this.incomingChunks.get(fileId);
+    if (!entry || entry.chunks.size !== entry.total || !entry.meta) return;
+    const meta = entry.meta;
+    let dataB64 = "";
+    for (let i = 0; i < entry.total; i++) dataB64 += entry.chunks.get(i) ?? "";
+    const object: MeshObject = {
+      id: fileId,
+      workspaceId: this.cfg.workspaceId,
+      type: meta.objectType,
+      content: { name: meta.name, mimeType: meta.mimeType, size: meta.size, dataB64 } satisfies FileContent,
+      createdBy: meta.createdBy,
+      createdAt: meta.createdAt,
+      updatedAt: meta.createdAt,
+      ...(meta.expiresAt !== undefined ? { expiresAt: meta.expiresAt } : {}),
+    };
+    const existingObject = await this.cfg.db.objects.get(object.id);
+    if (!existingObject) await this.cfg.db.objects.put(object);
+    this.incomingChunks.delete(fileId);
+    await this.cfg.db.fileChunks.where("fileId").equals(fileId).delete();
+    await this.recordIncomingDelivery(meta.createdBy, object.id, meta.options, now);
+    if (!existingObject) this.cfg.onObjectReceived?.(object, meta.createdBy);
+  }
+
+  /**
+   * A chunked file transfer normally finishes via FILE_CHUNK_ACK alone —
+   * this only kicks in when something went wrong: no ack progress for a
+   * while (resend the unacked chunks, the recipient may have reconnected
+   * without the sender hearing about it), or no progress for long enough
+   * that it's not worth retrying automatically anymore (fail it, so the UI
+   * can offer a manual retry instead of showing "Sending" forever).
+   */
+  private async retryStalledFileTransfers(): Promise<void> {
+    const now = this.now();
+    const sending = await this.cfg.db.deliveries.where("status").equals("sending").toArray();
+    for (const delivery of sending) {
+      const progress = delivery.chunkProgress;
+      if (!progress || progress.ackedChunks.length >= progress.totalChunks) continue;
+      if (now - delivery.createdAt > (this.cfg.fileTransferFailMs ?? FILE_TRANSFER_FAIL_MS)) {
+        await this.cfg.db.deliveries.update(delivery.id, { status: "failed" });
+        await this.recordEvent({
+          category: "transfer",
+          type: "delivery-failed",
+          title: "File transfer failed",
+          detail: `Gave up after ${Math.round((now - delivery.createdAt) / 1000)}s with ${progress.ackedChunks.length}/${progress.totalChunks} chunks acknowledged`,
+          deviceId: delivery.destinationDeviceId,
+          objectId: delivery.objectId,
+        });
+        continue;
+      }
+      if (now - (delivery.lastActivityAt ?? delivery.createdAt) < (this.cfg.fileTransferStallMs ?? FILE_TRANSFER_STALL_MS)) continue;
+      const object = await this.cfg.db.objects.get(delivery.objectId);
+      if (!object || (object.type !== "file" && object.type !== "image")) continue;
+      const acked = new Set(progress.ackedChunks);
+      const missing = new Set<number>();
+      for (let i = 0; i < progress.totalChunks; i++) if (!acked.has(i)) missing.add(i);
+      await this.sendFileChunks(object, object.content as FileContent, delivery.destinationDeviceId, delivery.options ?? {}, missing);
+      await this.cfg.db.deliveries.update(delivery.id, { lastActivityAt: now });
+      await this.recordEvent({
+        category: "transfer",
+        type: "delivery-retry",
+        title: "Resent missing file chunks",
+        detail: `${missing.size} of ${progress.totalChunks} chunks → ${delivery.destinationDeviceId}`,
+        deviceId: delivery.destinationDeviceId,
+        objectId: delivery.objectId,
+      });
+    }
+  }
+
+  /** Manually retry a "failed" delivery: re-sends the whole object from
+   *  scratch (fresh chunk progress for a file) rather than resuming, since a
+   *  failed transfer's partial ack state is stale enough not to trust. */
+  async retryDelivery(deliveryId: string): Promise<void> {
+    const delivery = await this.cfg.db.deliveries.get(deliveryId);
+    if (!delivery || delivery.status !== "failed") return;
+    const object = await this.cfg.db.objects.get(delivery.objectId);
+    if (!object) return;
+    const now = this.now();
+    const asFile = (object.type === "file" || object.type === "image") && (object.content as FileContent);
+    const chunked = asFile && asFile.dataB64.length > FILE_CHUNK_THRESHOLD_B64;
+    await this.cfg.db.deliveries.update(deliveryId, {
+      status: "queued",
+      createdAt: now,
+      lastActivityAt: now,
+      ...(chunked && asFile
+        ? { chunkProgress: { totalChunks: Math.ceil(asFile.dataB64.length / FILE_CHUNK_SIZE_B64), ackedChunks: [] } }
+        : {}),
+    });
+    const sentLive =
+      chunked && asFile
+        ? await this.sendFileChunks(object, asFile, delivery.destinationDeviceId, delivery.options ?? {})
+        : await this.sendOps(
+            delivery.destinationDeviceId,
+            [
+              this.makeOp("CREATE_OBJECT", object.id, { object } satisfies CreateObjectPayload),
+              this.makeOp("SEND_TO_DEVICE", object.id, {
+                objectId: object.id,
+                ...(delivery.options ? { options: delivery.options } : {}),
+              } satisfies SendToDevicePayload),
+            ],
+            DEFAULT_HOP_LIMIT,
+          );
+    if (sentLive) {
+      await this.cfg.db.deliveries.update(deliveryId, { status: "sending" });
+      await this.recordEvent({ category: "transfer", type: "delivery-sent", title: "Retried payload handed to transport", detail: `${object.type} → ${delivery.destinationDeviceId}`, deviceId: delivery.destinationDeviceId, objectId: object.id });
+    }
+  }
+
+  /**
+   * Collaborative text editing: apply the new text as a minimal splice on
+   * the object's Y.Text and broadcast the full doc state (idempotent and
+   * order-independent — concurrent edits on other devices merge instead
+   * of overwriting).
+   */
+  async editText(objectId: string, newText: string): Promise<void> {
+    const object = await this.cfg.db.objects.get(objectId);
+    if (!object || !EDITABLE_TYPES.has(object.type)) return;
+    // If no device has ever sent a Yjs update for this object (e.g. it was
+    // created by a peer that doesn't speak Yjs, like the Android app — see
+    // docs/Android.md), docFor() is about to hand back a doc seeded empty,
+    // not from the object's real content. Seed it here, from the last
+    // known text, before this edit — otherwise this edit's diff is taken
+    // against a false empty baseline and the resulting Y.Text loses the
+    // object's true prior content from its CRDT history. Only safe to do
+    // for OUR OWN edit: seeding docFor() itself would risk duplicating
+    // content against a genuine incoming update from a peer with real
+    // Yjs history for this object (a different, already-seeded lineage).
+    const hadNoPriorYjsState = !this.ydocs.has(objectId) && !(await this.cfg.db.ydocs.get(objectId));
+    const doc = await this.docFor(objectId);
+    const priorText = hadNoPriorYjsState ? ((object.content as TextContent | null)?.text ?? "") : "";
+    doc.transact(() => {
+      if (priorText) doc.getText("text").insert(0, priorText);
+      applyTextDiff(doc.getText("text"), newText);
+    });
+    await this.persistDoc(objectId, doc);
+    const title = (object.content as TextContent | null)?.title;
+    await this.cfg.db.objects.update(objectId, {
+      content: { text: doc.getText("text").toString(), ...(title ? { title } : {}) },
+      updatedAt: this.now(),
+    });
+    await this.broadcastOps([
+      this.makeOp("YJS_UPDATE", objectId, {
+        objectId,
+        updateB64: toBase64(Y.encodeStateAsUpdate(doc)),
+      } satisfies YjsUpdatePayload),
+    ]);
+  }
+
+  /**
+   * Tell other devices this one has (or no longer has) an object's editor
+   * open. Call on a heartbeat (every few seconds) while active, and once
+   * more with `active: false` on close/unmount — see EditPresencePayload's
+   * doc comment for why this exists and what it doesn't guarantee.
+   */
+  async setEditingPresence(objectId: string, active: boolean): Promise<void> {
+    await this.broadcastOps([
+      this.makeOp("EDIT_PRESENCE", objectId, { objectId, active } satisfies EditPresencePayload),
+    ]);
+  }
+
+  /** Other devices (not this one) currently believed to have `objectId` open for editing. */
+  editingPresenceFor(objectId: string): string[] {
+    const entries = this.editingPresence.get(objectId);
+    if (!entries) return [];
+    const cutoff = this.now() - EDIT_PRESENCE_STALE_MS;
+    return [...entries.entries()].filter(([, lastSeenAt]) => lastSeenAt >= cutoff).map(([deviceId]) => deviceId);
+  }
+
+  /** Last-write-wins content replacement (checklist toggles, etc.). */
+  async updateObjectContent(objectId: string, content: unknown): Promise<void> {
+    const now = this.now();
+    await this.cfg.db.objects.update(objectId, { content, updatedAt: now });
+    await this.broadcastOps([
+      this.makeOp("UPDATE_OBJECT", objectId, {
+        objectId,
+        content,
+        updatedAt: now,
+      } satisfies UpdateObjectPayload),
+    ]);
+  }
+
+  /**
+   * Corrects a wrong auto-detected type (e.g. a markdown document that was
+   * misclassified as a checklist): converts content into the new type's
+   * shape and syncs both the type and content change to other devices.
+   */
+  async retypeObject(objectId: string, newType: MeshObjectType): Promise<void> {
+    const object = await this.cfg.db.objects.get(objectId);
+    if (!object || object.type === newType) return;
+    const content = convertObjectContent(object.type, newType, object.content);
+    if (content === undefined) return;
+    const now = this.now();
+    await this.cfg.db.objects.update(objectId, { type: newType, content, updatedAt: now });
+    await this.broadcastOps([
+      this.makeOp("UPDATE_OBJECT", objectId, {
+        objectId,
+        content,
+        type: newType,
+        updatedAt: now,
+      } satisfies UpdateObjectPayload),
+    ]);
+  }
+
+  /**
+   * Hand an object off to another device: deliver it (idempotent if the
+   * device already has it) and ask that device to open it for editing.
+   */
+  async continueOnDevice(objectId: string, deviceId: string): Promise<void> {
+    const object = await this.cfg.db.objects.get(objectId);
+    if (!object) return;
+    const ops: Operation<unknown>[] = [
+      this.makeOp("CREATE_OBJECT", objectId, {
+        object,
+      } satisfies CreateObjectPayload),
+    ];
+    if (EDITABLE_TYPES.has(object.type)) {
+      const doc = await this.docFor(objectId);
+      ops.push(
+        this.makeOp("YJS_UPDATE", objectId, {
+          objectId,
+          updateB64: toBase64(Y.encodeStateAsUpdate(doc)),
+        } satisfies YjsUpdatePayload),
+      );
+    }
+    ops.push(
+      this.makeOp("SEND_TO_DEVICE", objectId, {
+        objectId,
+        options: {},
+      } satisfies SendToDevicePayload),
+      this.makeOp("CONTINUE_ON_DEVICE", objectId, {
+        objectId,
+      } satisfies ContinueOnDevicePayload),
+    );
+    await this.sendOps(deviceId, ops, DEFAULT_HOP_LIMIT);
+  }
+
+  /** Recipient-side: mark an object opened and notify the sender. */
+  async markOpened(objectId: string): Promise<void> {
+    const object = await this.cfg.db.objects.get(objectId);
+    if (!object || object.createdBy === this.me) return;
+    const delivery = await this.cfg.db.deliveries
+      .where("objectId")
+      .equals(objectId)
+      .and((d) => d.destinationDeviceId === this.me)
+      .first();
+    if (!delivery || delivery.status === "opened" || delivery.status === "pending") return;
+    await this.cfg.db.deliveries.update(delivery.id, {
+      status: "opened",
+      openedAt: this.now(),
+    });
+    await this.sendOps(object.createdBy, [
+      this.makeOp("MARK_OPENED", objectId, { objectId } satisfies ObjectRefPayload),
+    ]);
+    if (delivery.options?.deleteAfterOpening) {
+      await this.deleteObjectLocal(objectId);
+    }
+  }
+
+  /**
+   * Recipient-side: accept a requireConfirmation delivery — makes it act
+   * like a normal delivery from here on (status -> delivered, sender
+   * notified) so open/copy/edit actions become available in the UI.
+   */
+  async acceptObject(objectId: string): Promise<void> {
+    const delivery = await this.cfg.db.deliveries
+      .where("objectId")
+      .equals(objectId)
+      .and((d) => d.destinationDeviceId === this.me && d.status === "pending")
+      .first();
+    if (!delivery) return;
+    const now = this.now();
+    await this.cfg.db.deliveries.update(delivery.id, {
+      status: "delivered",
+      deliveredAt: now,
+    });
+    await this.sendOps(delivery.sourceDeviceId, [
+      this.makeOp("MARK_DELIVERED", objectId, { objectId } satisfies ObjectRefPayload),
+    ]);
+  }
+
+  /**
+   * Recipient-side: decline a requireConfirmation delivery. The object is
+   * removed locally and the sender is told so their delivery status
+   * reflects it, without ever executing/opening the content.
+   */
+  async rejectObject(objectId: string): Promise<void> {
+    const delivery = await this.cfg.db.deliveries
+      .where("objectId")
+      .equals(objectId)
+      .and((d) => d.destinationDeviceId === this.me && d.status === "pending")
+      .first();
+    if (!delivery) return;
+    await this.sendOps(delivery.sourceDeviceId, [
+      this.makeOp("REJECT_OBJECT", objectId, { objectId } satisfies ObjectRefPayload),
+    ]);
+    await this.deleteObjectLocal(objectId);
+  }
+
+  /** Local-only delete (MVP): removes the object and its delivery rows. */
+  async deleteObjectLocal(objectId: string): Promise<void> {
+    await this.cfg.db.deliveries.where("objectId").equals(objectId).delete();
+    await this.purgeObject(objectId);
+  }
+
+  /** Removes the object + its Yjs doc WITHOUT touching delivery rows —
+   *  used when a delivery's final status (expired, opened, ...) needs to
+   *  stay visible after the object content itself is gone. */
+  private async purgeObject(objectId: string): Promise<void> {
+    await this.cfg.db.objects.delete(objectId);
+    await this.cfg.db.ydocs.delete(objectId);
+    await this.cfg.db.objectStates.delete(objectId);
+    this.ydocs.get(objectId)?.destroy();
+    this.ydocs.delete(objectId);
+  }
+
+  private async docFor(objectId: string): Promise<Y.Doc> {
+    const cached = this.ydocs.get(objectId);
+    if (cached) return cached;
+    const doc = new Y.Doc();
+    const persisted = await this.cfg.db.ydocs.get(objectId);
+    if (persisted) Y.applyUpdate(doc, persisted.state);
+    this.ydocs.set(objectId, doc);
+    return doc;
+  }
+
+  private async persistDoc(objectId: string, doc: Y.Doc): Promise<void> {
+    await this.cfg.db.ydocs.put({ objectId, state: Y.encodeStateAsUpdate(doc) });
+  }
+
+  /** Send the same ops to every other device in the workspace. */
+  private async broadcastOps(ops: Operation<unknown>[]): Promise<void> {
+    const others = (await this.cfg.db.devices.toArray()).filter(
+      (d) => d.id !== this.me,
+    );
+    for (const device of others) {
+      await this.sendOps(device.id, ops);
+    }
+  }
+
+  /**
+   * Capability routing (docs/Roadmap.md Phase 5): "send this to whichever
+   * device has a terminal" instead of naming a specific device. Online
+   * devices advertising the capability come first (an immediate, direct
+   * send); offline ones are included after (queued/carried like any other
+   * delivery) so the request isn't silently dropped if nobody's online
+   * right now — the caller decides whether to include those.
+   */
+  async resolveCapability(capability: string): Promise<Device[]> {
+    const matches = (await this.cfg.db.devices.toArray()).filter(
+      (d) => d.id !== this.me && d.capabilities?.includes(capability),
+    );
+    return matches.sort((a, b) => {
+      if (a.status === b.status) return 0;
+      return a.status === "online" ? -1 : 1;
+    });
+  }
+
+  /**
+   * Owner-side revocation: tell the remaining devices and drop the device
+   * locally. Relay enforcement (rejecting the revoked device) happens via
+   * the HTTP revoke endpoint — see docs/Security.md §2. Unlike the old
+   * shared-workspace-key model, no group-wide rekey is needed: ratchet
+   * sessions are pairwise, so dropping this one session doesn't touch
+   * anyone else's secrecy (docs/Security.md §5).
+   */
+  async revokeDevice(deviceId: string): Promise<void> {
+    const others = (await this.cfg.db.devices.toArray()).filter(
+      (d) => d.id !== this.me && d.id !== deviceId,
+    );
+    for (const device of others) {
+      await this.sendOps(device.id, [
+        this.makeOp("REVOKE_DEVICE", undefined, {
+          deviceId,
+        } satisfies RevokeDevicePayload),
+      ]);
+    }
+    await this.cfg.db.devices.delete(deviceId);
+    this.peerKeys.delete(deviceId);
+    this.ratchets.delete(deviceId);
+    await this.cfg.db.ratchets.delete(deviceId);
+  }
+
+  // --- internals ---
+
+  /**
+   * Get-or-create the Double Ratchet session with a peer (docs/Security.md
+   * §5). Bootstraps from the peer's X25519 identity key (learned via
+   * presence) and the workspace pairing secret; every pair in the
+   * workspace gets its own independent session, so revoking one device
+   * never requires touching anyone else's secrecy.
+   */
+  private async ratchetSessionFor(peerDeviceId: string): Promise<RatchetSession> {
+    const cached = this.ratchets.get(peerDeviceId);
+    if (cached) return cached;
+
+    const stored = await this.cfg.db.ratchets.get(peerDeviceId);
+    if (stored) {
+      const { peerDeviceId: _discard, ...session } = stored;
+      const restored = session as unknown as RatchetSession;
+      this.ratchets.set(peerDeviceId, restored);
+      return restored;
+    }
+
+    const peer = await this.cfg.db.devices.get(peerDeviceId);
+    if (!peer?.encryptionKey) {
+      throw new Error(
+        `cannot start a ratchet session with ${peerDeviceId}: no encryption key on file`,
+      );
+    }
+    const session = await initRatchetSession({
+      workspaceId: this.cfg.workspaceId,
+      myDeviceId: this.me,
+      myIdentityPublic: this.cfg.identity.encryptionPublicKey,
+      myIdentityPrivate: this.cfg.identity.encryptionPrivateKey,
+      peerDeviceId,
+      peerIdentityPublic: await importEncryptionPublicKey(peer.encryptionKey),
+      pairingSecret: this.pairingSecret,
+    });
+    this.ratchets.set(peerDeviceId, session);
+    await this.persistRatchetSession(peerDeviceId, session);
+    return session;
+  }
+
+  private async persistRatchetSession(
+    peerDeviceId: string,
+    session: RatchetSession,
+  ): Promise<void> {
+    await this.cfg.db.ratchets.put({
+      peerDeviceId,
+      ...session,
+    } as unknown as PersistedRatchetSession);
+  }
+
+  private makeOp<T>(
+    type: OperationType,
+    objectId: string | undefined,
+    payload: T,
+  ): Operation<T> {
+    return {
+      operationId: crypto.randomUUID(),
+      deviceId: this.me,
+      workspaceId: this.cfg.workspaceId,
+      type,
+      ...(objectId !== undefined ? { objectId } : {}),
+      timestamp: this.now(),
+      payload,
+    };
+  }
+
+  /**
+   * Seal ops into an envelope; send live or queue in the outbox.
+   * `hopLimit` bounds store-carry-forward fan-out for THIS bundle if it
+   * ends up queued (0 = never offered to a carrier — appropriate for
+   * acks/control ops, which are cheap to just re-send once back online).
+   */
+  private async sendOps(
+    recipientId: string,
+    ops: Operation<unknown>[],
+    hopLimit = 0,
+  ): Promise<boolean> {
+    this.seq += 1;
+    await this.cfg.db.settings.put({ key: "mySeq", value: this.seq });
+
+    const session = await this.ratchetSessionFor(recipientId);
+    const { messageKey, header } = await ratchetEncrypt(session);
+    await this.persistRatchetSession(recipientId, session);
+
+    const plaintext = new TextEncoder().encode(JSON.stringify({ ops }));
+    const envelope = await sealEnvelope({
+      identity: this.cfg.identity,
+      recipientDeviceId: recipientId,
+      workspaceId: this.cfg.workspaceId,
+      messageKey,
+      ratchetHeader: header,
+      plaintext,
+      sequenceNumber: this.seq,
+      createdAt: this.now(),
+    });
+    const json = envelopeToJson(envelope);
+    const bytes = new TextEncoder().encode(JSON.stringify(json));
+
+    if (await this.deliverBytes(recipientId, bytes)) return true;
+
+    await this.cfg.db.outbox.add({
+      bundleId: envelope.messageId,
+      sourceDeviceId: this.me,
+      destinationDeviceId: recipientId,
+      workspaceId: this.cfg.workspaceId,
+      encryptedPayload: bytes,
+      createdAt: envelope.createdAt,
+      expiresAt: envelope.createdAt + OUTBOX_TTL_MS,
+      hopLimit,
+      signature: envelope.signature,
+      offeredTo: [],
+    });
+    await this.recordEvent({ category: "transfer", type: "delivery-queued", title: "Payload waiting for a route", detail: `Encrypted bundle queued for ${recipientId}`, deviceId: recipientId });
+    return false;
+  }
+
+  /**
+   * Try a direct peer-to-peer channel first (payload then bypasses the
+   * relay entirely), then the relay. Returns false if neither is
+   * currently available — caller queues for later.
+   */
+  private async deliverBytes(recipientId: string, bytes: Uint8Array): Promise<boolean> {
+    if (this.cfg.direct) {
+      try {
+        if (await this.cfg.direct.trySend(recipientId, bytes)) return true;
+      } catch {
+        // fall through to the relay
+      }
+    }
+    if (this.cfg.transport.isConnected) {
+      try {
+        const json = JSON.parse(new TextDecoder().decode(bytes)) as EnvelopeJson;
+        this.cfg.transport.sendEnvelope(json);
+        return true;
+      } catch {
+        // fall through — caller queues
+      }
+    }
+    return false;
+  }
+
+  private async drainOutbox(): Promise<void> {
+    await this.cfg.db.outbox.where("expiresAt").below(this.now()).delete();
+    for (const bundle of await this.cfg.db.outbox.toArray()) {
+      if (await this.deliverBytes(bundle.destinationDeviceId, bundle.encryptedPayload)) {
+        await this.cfg.db.outbox.delete(bundle.bundleId);
+        await this.recordEvent({ category: "network", type: "outbox-drained", title: "Queued payload resumed", detail: `A route opened to ${bundle.destinationDeviceId}`, deviceId: bundle.destinationDeviceId });
+      }
+    }
+  }
+
+  /**
+   * Store–carry–forward, part 1: for each bundle this device is CARRYING
+   * on behalf of someone else, forward it the moment the true destination
+   * looks reachable — same encrypted bytes, so the destination verifies
+   * and decrypts exactly as if it arrived directly from the sender.
+   */
+  private async attemptCarriedDelivery(): Promise<void> {
+    const now = this.now();
+    await this.cfg.db.carried.where("expiresAt").below(now).delete();
+    for (const bundle of await this.cfg.db.carried.toArray()) {
+      const dest = await this.cfg.db.devices.get(bundle.destinationDeviceId);
+      if (dest?.status !== "online") continue;
+      if (await this.forwardCarriedBytes(bundle.destinationDeviceId, bundle.encryptedPayload)) {
+        await this.cfg.db.carried.delete(bundle.bundleId);
+        await this.recordEvent({ category: "network", type: "carried-forwarded", title: "Carried bundle forwarded", detail: `Encrypted bundle forwarded to ${bundle.destinationDeviceId}`, deviceId: bundle.destinationDeviceId });
+      }
+    }
+  }
+
+  /**
+   * Like deliverBytes, but for envelopes we're carrying on someone else's
+   * behalf: over the relay this MUST use forwardEnvelope (type "forward"),
+   * not sendEnvelope — the relay rejects "envelope" messages whose inner
+   * senderDeviceId doesn't match our own authenticated connection, which
+   * is exactly true here (we're relaying, not sending our own). A direct
+   * peer channel has no such restriction — it's just bytes to the peer.
+   */
+  private async forwardCarriedBytes(recipientId: string, bytes: Uint8Array): Promise<boolean> {
+    if (this.cfg.direct) {
+      try {
+        if (await this.cfg.direct.trySend(recipientId, bytes)) return true;
+      } catch {
+        // fall through to the relay
+      }
+    }
+    if (this.cfg.transport.isConnected) {
+      try {
+        const json = JSON.parse(new TextDecoder().decode(bytes)) as EnvelopeJson;
+        this.cfg.transport.forwardEnvelope(json);
+        return true;
+      } catch {
+        // fall through — caller keeps the bundle queued
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Store–carry–forward, part 2: for our own OUTBOX bundles stuck behind
+   * an offline destination, hand a copy to one currently-online peer
+   * (never the destination itself) as a carrier — bounded by hopLimit so
+   * fan-out can't run away. We keep trying direct delivery ourselves too
+   * (drainOutbox); carrying is purely supplemental redundancy for when we
+   * go offline again before the destination ever reconnects to us.
+   */
+  private async offerCarrying(): Promise<void> {
+    const outboxBundles = await this.cfg.db.outbox.toArray();
+    if (outboxBundles.length === 0) return;
+    const onlinePeers = (await this.cfg.db.devices.toArray()).filter(
+      (d) => d.id !== this.me && d.status === "online",
+    );
+    if (onlinePeers.length === 0) return;
+
+    for (const bundle of outboxBundles) {
+      if (bundle.hopLimit <= 0) continue;
+      const offeredTo = bundle.offeredTo ?? [];
+      const carrier = onlinePeers.find(
+        (d) => d.id !== bundle.destinationDeviceId && !offeredTo.includes(d.id),
+      );
+      if (!carrier) continue;
+
+      const nextHopLimit = bundle.hopLimit - 1;
+      const sent = await this.sendOps(carrier.id, [
+        this.makeOp("CARRY_BUNDLE", undefined, {
+          bundleId: bundle.bundleId,
+          sourceDeviceId: bundle.sourceDeviceId,
+          destinationDeviceId: bundle.destinationDeviceId,
+          encryptedPayloadB64: toBase64(bundle.encryptedPayload),
+          createdAt: bundle.createdAt,
+          expiresAt: bundle.expiresAt,
+          hopLimit: nextHopLimit,
+        } satisfies CarryBundlePayload),
+      ]);
+      if (sent) {
+        await this.cfg.db.outbox.update(bundle.bundleId, {
+          hopLimit: nextHopLimit,
+          offeredTo: [...offeredTo, carrier.id],
+        });
+        await this.recordEvent({ category: "network", type: "carrier-assigned", title: "Trusted carrier assigned", detail: `Encrypted bundle offered to ${carrier.name}`, deviceId: carrier.id });
+      }
+    }
+  }
+
+  /** Delete MeshObjects whose expiresAt has passed; mark their in-flight
+   *  deliveries "expired" (kept, not deleted, so Sent/inbox history still
+   *  shows the final status) rather than leaving them stuck as queued/sending. */
+  private async sweepExpiredObjects(): Promise<void> {
+    const now = this.now();
+    for (const object of await this.cfg.db.objects.where("expiresAt").below(now).toArray()) {
+      const deliveries = await this.cfg.db.deliveries.where("objectId").equals(object.id).toArray();
+      for (const delivery of deliveries) {
+        if (delivery.status !== "opened") {
+          await this.cfg.db.deliveries.update(delivery.id, { status: "expired" });
+        }
+      }
+      await this.purgeObject(object.id);
+    }
+  }
+
+  /**
+   * Runs on a timer (and once at startup / on presence change) to advance
+   * expiry and store-carry-forward without needing a user action. Guarded
+   * against re-entrancy: the timer and presence updates can both trigger
+   * this close together, and running attemptCarriedDelivery/offerCarrying
+   * concurrently with itself would let both invocations read the
+   * carried/outbox tables before either deletes its entry — forwarding
+   * (or offering) the same bundle twice.
+   */
+  private sweeping = false;
+  private async periodicSweep(): Promise<void> {
+    if (this.sweeping) return;
+    this.sweeping = true;
+    try {
+      await this.sweepExpiredObjects();
+      await this.attemptCarriedDelivery();
+      await this.offerCarrying();
+      await this.retryStalledFileTransfers();
+    } catch (err) {
+      console.error("screenmesh: periodic sweep failed", err);
+    } finally {
+      this.sweeping = false;
+    }
+  }
+
+  private async handleIncoming(data: Uint8Array): Promise<void> {
+    const json = JSON.parse(new TextDecoder().decode(data)) as EnvelopeJson;
+    const envelope = envelopeFromJson(json);
+    const now = this.now();
+
+    if (envelope.recipientDeviceId !== this.me) return;
+    if (envelope.workspaceId !== this.cfg.workspaceId) return;
+    if (await this.cfg.db.seen.get(envelope.messageId)) return;
+
+    // Authenticity MUST be checked before the ratchet header is trusted
+    // for anything — deriving a message key mutates session state, and a
+    // forged header (before verification) must never be allowed to do
+    // that. See packages/crypto/src/envelope.ts's module doc comment.
+    const senderKey = await this.keyFor(envelope.senderDeviceId);
+    await verifyEnvelope(envelope, senderKey, now);
+
+    const session = await this.ratchetSessionFor(envelope.senderDeviceId);
+    const messageKey = await ratchetDecrypt(session, {
+      ratchetPublicKeyB64: envelope.ratchetPublicKeyB64,
+      messageNumber: envelope.messageNumber,
+      previousChainLength: envelope.previousChainLength,
+    });
+    await this.persistRatchetSession(envelope.senderDeviceId, session);
+    const plaintext = await decryptEnvelope(envelope, messageKey);
+    await this.cfg.db.seen.add({ messageId: envelope.messageId, seenAt: now });
+
+    const { ops } = JSON.parse(new TextDecoder().decode(plaintext)) as {
+      ops: Operation<unknown>[];
+    };
+    const newObjects: MeshObject[] = [];
+    for (const op of ops) {
+      const object = await this.applyOp(envelope.senderDeviceId, op);
+      if (object) newObjects.push(object);
+    }
+    // Fired only after every op in the envelope is applied — a
+    // CREATE_OBJECT's sibling SEND_TO_DEVICE (same envelope) has already
+    // created the delivery record by now, so a consumer calling
+    // markOpened() from this callback finds it. See applyOp's doc comment.
+    for (const object of newObjects) {
+      this.cfg.onObjectReceived?.(object, envelope.senderDeviceId);
+    }
+  }
+
+  /**
+   * Returns a newly-received object (if this op created one) so
+   * handleIncoming can fire onObjectReceived AFTER every op in the
+   * envelope has been applied — not per-op. A CREATE_OBJECT and its
+   * sibling SEND_TO_DEVICE always travel in the SAME envelope (see
+   * sendObject), so firing the callback mid-envelope would let a
+   * non-reactive consumer's markOpened() run before the delivery record
+   * SEND_TO_DEVICE creates even exists.
+   */
+  private async applyOp(senderId: string, op: Operation<unknown>): Promise<MeshObject | null> {
+    // EDIT_PRESENCE is a heartbeat, not part of the durable object model —
+    // persisting it would grow the oplog by one row every few seconds for
+    // as long as anyone's editor stays open, for data that's meaningless
+    // once superseded. Every other op type IS persisted here.
+    if (op.type !== "EDIT_PRESENCE") {
+      await this.cfg.db.operations.put(op);
+    }
+    const now = this.now();
+    let newObject: MeshObject | null = null;
+
+    switch (op.type) {
+      case "CREATE_OBJECT": {
+        const { object } = op.payload as CreateObjectPayload;
+        const existing = await this.cfg.db.objects.get(object.id);
+        if (!existing) {
+          await this.cfg.db.objects.put(object);
+          newObject = object;
+        }
+        break;
+      }
+      case "UPDATE_OBJECT": {
+        const { objectId, content, updatedAt, type } = op.payload as UpdateObjectPayload;
+        const object = await this.cfg.db.objects.get(objectId);
+        if (object && updatedAt >= object.updatedAt) {
+          await this.cfg.db.objects.update(objectId, { content, updatedAt, ...(type ? { type } : {}) });
+        }
+        break;
+      }
+      case "YJS_UPDATE": {
+        const { objectId, updateB64 } = op.payload as YjsUpdatePayload;
+        const doc = await this.docFor(objectId);
+        Y.applyUpdate(doc, fromBase64(updateB64));
+        await this.persistDoc(objectId, doc);
+        const object = await this.cfg.db.objects.get(objectId);
+        if (object && EDITABLE_TYPES.has(object.type)) {
+          const merged = doc.getText("text").toString();
+          const current = (object.content as TextContent | null)?.text ?? "";
+          if (merged !== current) {
+            const title = (object.content as TextContent | null)?.title;
+            await this.cfg.db.objects.update(objectId, {
+              content: { text: merged, ...(title ? { title } : {}) },
+              updatedAt: now,
+            });
+          }
+        }
+        break;
+      }
+      case "EDIT_PRESENCE": {
+        const { objectId, active } = op.payload as EditPresencePayload;
+        let entries = this.editingPresence.get(objectId);
+        if (active) {
+          if (!entries) {
+            entries = new Map();
+            this.editingPresence.set(objectId, entries);
+          }
+          entries.set(senderId, now);
+        } else {
+          entries?.delete(senderId);
+        }
+        this.cfg.onEditingPresenceChanged?.(objectId, this.editingPresenceFor(objectId));
+        break;
+      }
+      case "CONTINUE_ON_DEVICE": {
+        const { objectId } = op.payload as ContinueOnDevicePayload;
+        await this.cfg.db.settings.put({
+          key: "focusObject",
+          value: { objectId, from: senderId, at: now },
+        });
+        break;
+      }
+      case "SEND_TO_DEVICE": {
+        const { objectId, options } = op.payload as SendToDevicePayload;
+        await this.recordIncomingDelivery(senderId, objectId, options, now);
+        break;
+      }
+      case "FILE_CHUNK": {
+        const payload = op.payload as FileChunkPayload;
+        let entry = this.incomingChunks.get(payload.fileId);
+        if (!entry) {
+          entry = { total: payload.totalChunks, chunks: new Map() };
+          this.incomingChunks.set(payload.fileId, entry);
+        }
+        // Duplicate chunk (a retried resend the sender already had an ack for
+        // in flight, or two acks crossed) — nothing new to persist or ack twice for.
+        const isNewChunk = !entry.chunks.has(payload.chunkIndex);
+        entry.chunks.set(payload.chunkIndex, payload.dataB64);
+        if (payload.meta) entry.meta = payload.meta;
+
+        // Persisted BEFORE acking: if the tab dies right after this write,
+        // start()'s rehydrate sees the chunk as already-received next launch.
+        if (isNewChunk) {
+          await this.cfg.db.fileChunks.put({
+            id: `${payload.fileId}:${payload.chunkIndex}`,
+            fileId: payload.fileId,
+            chunkIndex: payload.chunkIndex,
+            totalChunks: payload.totalChunks,
+            dataB64: payload.dataB64,
+            ...(payload.meta ? { meta: payload.meta } : {}),
+          });
+        }
+        await this.sendOps(senderId, [
+          this.makeOp("FILE_CHUNK_ACK", payload.fileId, {
+            fileId: payload.fileId,
+            chunkIndex: payload.chunkIndex,
+          } satisfies FileChunkAckPayload),
+        ]);
+
+        if (entry.chunks.size === entry.total && entry.meta) {
+          const meta = entry.meta;
+          let dataB64 = "";
+          for (let i = 0; i < entry.total; i++) dataB64 += entry.chunks.get(i) ?? "";
+          const object: MeshObject = {
+            id: payload.fileId,
+            workspaceId: op.workspaceId,
+            type: meta.objectType,
+            content: {
+              name: meta.name,
+              mimeType: meta.mimeType,
+              size: meta.size,
+              dataB64,
+            } satisfies FileContent,
+            createdBy: meta.createdBy,
+            createdAt: meta.createdAt,
+            updatedAt: meta.createdAt,
+            ...(meta.expiresAt !== undefined ? { expiresAt: meta.expiresAt } : {}),
+          };
+          const existingObject = await this.cfg.db.objects.get(object.id);
+          if (!existingObject) {
+            await this.cfg.db.objects.put(object);
+            newObject = object;
+          }
+          this.incomingChunks.delete(payload.fileId);
+          await this.cfg.db.fileChunks.where("fileId").equals(payload.fileId).delete();
+          await this.recordIncomingDelivery(senderId, object.id, meta.options, now);
+        }
+        break;
+      }
+      case "FILE_CHUNK_ACK": {
+        const payload = op.payload as FileChunkAckPayload;
+        const delivery = await this.cfg.db.deliveries
+          .where("objectId")
+          .equals(payload.fileId)
+          .and((d) => d.sourceDeviceId === this.me && d.destinationDeviceId === senderId)
+          .first();
+        if (delivery?.chunkProgress && !delivery.chunkProgress.ackedChunks.includes(payload.chunkIndex)) {
+          await this.cfg.db.deliveries.update(delivery.id, {
+            chunkProgress: {
+              totalChunks: delivery.chunkProgress.totalChunks,
+              ackedChunks: [...delivery.chunkProgress.ackedChunks, payload.chunkIndex],
+            },
+            lastActivityAt: now,
+          });
+        }
+        break;
+      }
+      case "MARK_DELIVERED": {
+        const { objectId } = op.payload as ObjectRefPayload;
+        const delivery = await this.cfg.db.deliveries
+          .where("objectId")
+          .equals(objectId)
+          .and(
+            (d) => d.sourceDeviceId === this.me && d.destinationDeviceId === senderId,
+          )
+          .first();
+        if (delivery && delivery.status !== "opened") {
+          await this.cfg.db.deliveries.update(delivery.id, {
+            status: "delivered",
+            deliveredAt: now,
+          });
+        }
+        break;
+      }
+      case "MARK_OPENED": {
+        const { objectId } = op.payload as ObjectRefPayload;
+        const delivery = await this.cfg.db.deliveries
+          .where("objectId")
+          .equals(objectId)
+          .and(
+            (d) => d.sourceDeviceId === this.me && d.destinationDeviceId === senderId,
+          )
+          .first();
+        if (delivery) {
+          await this.cfg.db.deliveries.update(delivery.id, {
+            status: "opened",
+            openedAt: now,
+          });
+        }
+        break;
+      }
+      case "DELETE_OBJECT": {
+        const { objectId } = op.payload as ObjectRefPayload;
+        await this.cfg.db.objects.delete(objectId);
+        break;
+      }
+      case "REJECT_OBJECT": {
+        const { objectId } = op.payload as ObjectRefPayload;
+        const delivery = await this.cfg.db.deliveries
+          .where("objectId")
+          .equals(objectId)
+          .and(
+            (d) => d.sourceDeviceId === this.me && d.destinationDeviceId === senderId,
+          )
+          .first();
+        if (delivery) {
+          await this.cfg.db.deliveries.update(delivery.id, { status: "rejected" });
+        }
+        break;
+      }
+      case "CARRY_BUNDLE": {
+        const payload = op.payload as CarryBundlePayload;
+        if (payload.destinationDeviceId === this.me) break; // nothing to carry to ourselves
+        if (payload.expiresAt <= now) break;
+        if (await this.cfg.db.carried.get(payload.bundleId)) break; // already holding it
+        const bundle: DeliveryBundle = {
+          bundleId: payload.bundleId,
+          sourceDeviceId: payload.sourceDeviceId,
+          destinationDeviceId: payload.destinationDeviceId,
+          workspaceId: op.workspaceId,
+          encryptedPayload: fromBase64(payload.encryptedPayloadB64),
+          createdAt: payload.createdAt,
+          expiresAt: payload.expiresAt,
+          hopLimit: payload.hopLimit,
+          // The carrier can't independently verify the inner envelope's
+          // signature (it may not have that sender's key cached) — the
+          // true destination re-verifies it on arrival regardless.
+          signature: new Uint8Array(),
+        };
+        await this.cfg.db.carried.add(bundle);
+        break;
+      }
+      case "REVOKE_DEVICE": {
+        const { deviceId } = op.payload as RevokeDevicePayload;
+        if (senderId !== this.cfg.ownerDeviceId) break;
+        await this.cfg.db.devices.delete(deviceId);
+        this.peerKeys.delete(deviceId);
+        this.ratchets.delete(deviceId);
+        await this.cfg.db.ratchets.delete(deviceId);
+        break;
+      }
+      default:
+        break;
+    }
+    return newObject;
+  }
+
+  private async applyPresence(entries: PresenceEntry[]): Promise<void> {
+    const previous = new Map((await this.cfg.db.devices.toArray()).map((device) => [device.id, device]));
+    const rows: Device[] = entries.map((entry) => ({
+      id: entry.id,
+      name: entry.name,
+      publicKey: entry.publicKey,
+      ...(entry.encryptionKey !== undefined
+        ? { encryptionKey: entry.encryptionKey }
+        : {}),
+      ...(entry.capabilities !== undefined ? { capabilities: entry.capabilities } : {}),
+      type: entry.type,
+      role: entry.type === "phone" ? "input" : "editor",
+      lastSeenAt: entry.lastSeenAt,
+      status: entry.online ? "online" : "offline",
+      trusted: true,
+    }));
+    await this.cfg.db.devices.bulkPut(rows);
+    for (const row of rows) {
+      const was = previous.get(row.id);
+      if (was && was.status !== row.status) {
+        await this.recordEvent({ category: "device", type: row.status === "online" ? "device-online" : "device-offline", title: row.status === "online" ? "Device came online" : "Device went offline", detail: row.name, deviceId: row.id });
+      } else if (!was) {
+        await this.recordEvent({ category: "device", type: "device-joined", title: "Device joined workspace", detail: row.name, deviceId: row.id });
+      }
+    }
+    // The roster is authoritative: devices no longer in it were revoked.
+    const ids = new Set(entries.map((entry) => entry.id));
+    await this.cfg.db.devices.filter((d) => !ids.has(d.id)).delete();
+
+    // A device just went online — that's the moment carried bundles for
+    // it can be forwarded, and a moment a new carrier becomes available.
+    // Routed through periodicSweep's reentrancy guard so this can't race
+    // the timer-driven sweep (see periodicSweep's doc comment).
+    void this.periodicSweep();
+  }
+
+  /**
+   * Recipient-side bookkeeping shared by SEND_TO_DEVICE (normal objects)
+   * and completed FILE_CHUNK reassembly: record the delivery (gated
+   * "pending" if the sender required confirmation) and ack the sender.
+   */
+  private async recordIncomingDelivery(
+    senderId: string,
+    objectId: string,
+    options: SendOptions | undefined,
+    now: number,
+  ): Promise<void> {
+    const existing = await this.cfg.db.deliveries
+      .where("objectId")
+      .equals(objectId)
+      .and((d) => d.destinationDeviceId === this.me && d.sourceDeviceId === senderId)
+      .first();
+    const gated = !!options?.requireConfirmation;
+    if (!existing) {
+      await this.cfg.db.deliveries.add({
+        id: crypto.randomUUID(),
+        objectId,
+        sourceDeviceId: senderId,
+        destinationDeviceId: this.me,
+        status: gated ? "pending" : "delivered",
+        createdAt: now,
+        ...(gated ? {} : { deliveredAt: now }),
+        ...(options && Object.keys(options).length > 0 ? { options } : {}),
+      });
+      await this.recordEvent({ category: "transfer", type: "delivery-received", title: "Payload received", detail: `From ${senderId}`, deviceId: senderId, objectId });
+    }
+    if (!gated) {
+      await this.sendOps(senderId, [
+        this.makeOp("MARK_DELIVERED", objectId, { objectId } satisfies ObjectRefPayload),
+      ]);
+    }
+  }
+
+  private async keyFor(deviceId: string): Promise<CryptoKey> {
+    const cached = this.peerKeys.get(deviceId);
+    if (cached) return cached;
+    const device = await this.cfg.db.devices.get(deviceId);
+    if (!device) throw new Error(`unknown sender device ${deviceId}`);
+    const key = await importPublicKey(device.publicKey);
+    this.peerKeys.set(deviceId, key);
+    return key;
+  }
+}
